@@ -2,7 +2,7 @@ from azure.eventhub.aio import EventHubConsumerClient
 from azure.eventhub.extensions.checkpointstoreblobaio import BlobCheckpointStore  # noqa
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
-from json import dumps
+from kafka.serializer import JsonSerializer
 from dotenv import load_dotenv
 
 import asyncio
@@ -31,29 +31,41 @@ KAFKA_SERVERS = os.environ.get('KAFKA_SERVERS', 'localhost:9092'
 
 # Connection to Kafka
 producer = KafkaProducer(bootstrap_servers=KAFKA_SERVERS,
-                         api_version=(0, 11, 5),
-                         value_serializer=lambda
-                         v: dumps(v).encode('utf-8'))
+                         value_serializer=JsonSerializer())
 
 
 def kafka_snd(topic, msg):
+    """Send msg to Kafka. Returns True only once the broker has acked it."""
     future = producer.send(topic, msg)
     # Block for 'synchronous' sends
     try:
         future.get(timeout=10)
+        return True
     except KafkaError as ex:
-        # Decide what to do if produce request failed...
         logger.error(ex)
+        return False
 
 
 async def on_event(partition_context, event):
+    # Azure passes event=None when max_wait_time elapses with no events.
+    if event is None:
+        return
+
+    body = event.body_as_str(encoding='UTF-8')
+
     # Print the event data.
     logger.debug("Received the event: \"{}\" from the partition with "
-          "ID: \"{}\"".format(event.body_as_str(encoding='UTF-8'), partition_context.partition_id))  # noqa
+                 "ID: \"{}\"".format(body, partition_context.partition_id))
     logger.warning('.')
 
-    # Send message to Kafka
-    kafka_snd('data', event.body_as_str(encoding='UTF-8'))
+    # Send message to Kafka. Only checkpoint once Kafka has acked the event:
+    # checkpointing after a failed send would advance past an event that was
+    # never delivered, losing it permanently.
+    if not kafka_snd('data', body):
+        logger.error("Kafka delivery failed for partition \"%s\"; not "
+                     "checkpointing so the event is redelivered",
+                     partition_context.partition_id)
+        return
 
     # Update the checkpoint so that the program doesn't read the events
     # that it has already read when you run it next time.
